@@ -24,7 +24,6 @@ enum RoleName {
 enum CustomerTier {
   ANONYMOUS
   LEAD
-  KNOWN
   FIRST_TIME_BUYER
   REPEAT_BUYER
   VIP_LUMINARY
@@ -36,6 +35,14 @@ enum CheckoutSessionStatus {
   PENDING_STK
   COMPLETED
   COMPLETED_LATE
+  EXPIRED
+  CANCELLED
+}
+
+enum ReservationStatus {
+  ACTIVE
+  RELEASED
+  CONSUMED
   EXPIRED
   CANCELLED
 }
@@ -54,6 +61,14 @@ enum PaymentMethod {
   MPESA_PAYBILL
   CARD
   STORE_CREDIT
+}
+
+enum CallbackStatus {
+  RECEIVED
+  PROCESSED
+  DUPLICATE
+  FAILED
+  UNMATCHED
 }
 
 enum OrderStatus {
@@ -106,16 +121,16 @@ enum TicketStatus {
 // ==========================================
 
 model User {
-  id            String     @id @default(uuid())
-  email         String     @unique
-  passwordHash  String     @map("password_hash")
-  fullName      String     @map("full_name")
-  isActive      Boolean    @default(true) @map("is_active")
-  createdAt     DateTime   @default(now()) @map("created_at")
-  updatedAt     DateTime   @updatedAt @map("updated_at")
+  id           String   @id @default(uuid())
+  email        String   @unique
+  passwordHash String   @map("password_hash")
+  fullName     String   @map("full_name")
+  isActive     Boolean  @default(true) @map("is_active")
+  createdAt    DateTime @default(now()) @map("created_at")
+  updatedAt    DateTime @updatedAt @map("updated_at")
 
-  userRoles     UserRole[]
-  movements     InventoryMovement[]
+  userRoles UserRole[]
+  movements InventoryMovement[]
 
   @@map("users")
 }
@@ -244,11 +259,11 @@ model ProductImage {
 // ==========================================
 
 model Inventory {
-  id                    String   @id @default(uuid())
-  variantId             String   @unique @map("variant_id")
-  stockQuantity         Int      @default(0) @map("stock_quantity")
-  safetyStockThreshold  Int      @default(3) @map("safety_stock_threshold")
-  updatedAt             DateTime @updatedAt @map("updated_at")
+  id                   String   @id @default(uuid())
+  variantId            String   @unique @map("variant_id")
+  stockQuantity        Int      @default(0) @map("stock_quantity")
+  safetyStockThreshold Int      @default(3) @map("safety_stock_threshold")
+  updatedAt            DateTime @updatedAt @map("updated_at")
 
   variant ProductVariant @relation(fields: [variantId], references: [id], onDelete: Cascade)
 
@@ -256,17 +271,21 @@ model Inventory {
 }
 
 model InventoryReservation {
-  id                String   @id @default(uuid())
-  variantId         String   @map("variant_id")
-  checkoutSessionId String   @map("checkout_session_id")
-  quantity          Int      @default(1)
-  expiresAt         DateTime @map("expires_at")
-  isReleased        Boolean  @default(false) @map("is_released")
-  createdAt         DateTime @default(now()) @map("created_at")
+  id                String            @id @default(uuid())
+  variantId         String            @map("variant_id")
+  checkoutSessionId String            @map("checkout_session_id")
+  quantity          Int               @default(1)
+  status            ReservationStatus @default(ACTIVE)
+  expiresAt         DateTime          @map("expires_at")
+  consumedAt        DateTime?         @map("consumed_at")
+  releasedAt        DateTime?         @map("released_at")
+  createdAt         DateTime          @default(now()) @map("created_at")
 
-  variant ProductVariant @relation(fields: [variantId], references: [id])
+  variant         ProductVariant  @relation(fields: [variantId], references: [id])
+  checkoutSession CheckoutSession @relation(fields: [checkoutSessionId], references: [id], onDelete: Cascade)
 
-  @@index([variantId, expiresAt, isReleased])
+  @@unique([checkoutSessionId, variantId])
+  @@index([variantId, status, expiresAt])
   @@map("inventory_reservations")
 }
 
@@ -291,16 +310,16 @@ model InventoryMovement {
 // ==========================================
 
 model Customer {
-  id             String       @id @default(uuid())
-  phoneNumber    String       @unique @map("phone_number")
-  email          String?      @unique
-  firstName      String       @map("first_name")
-  lastName       String       @map("last_name")
-  customerTier   CustomerTier @default(ANONYMOUS) @map("customer_tier")
-  totalSpendKes  Decimal      @default(0) @map("total_spend_kes") @db.Decimal(12, 2)
-  ordersCount    Int          @default(0) @map("orders_count")
-  createdAt      DateTime     @default(now()) @map("created_at")
-  updatedAt      DateTime     @updatedAt @map("updated_at")
+  id            String       @id @default(uuid())
+  phoneNumber   String       @unique @map("phone_number")
+  email         String?      @unique
+  firstName     String       @map("first_name")
+  lastName      String       @map("last_name")
+  customerTier  CustomerTier @default(ANONYMOUS) @map("customer_tier")
+  totalSpendKes Decimal      @default(0) @map("total_spend_kes") @db.Decimal(12, 2)
+  ordersCount   Int          @default(0) @map("orders_count")
+  createdAt     DateTime     @default(now()) @map("created_at")
+  updatedAt     DateTime     @updatedAt @map("updated_at")
 
   addresses     CustomerAddress[]
   carts         Cart[]
@@ -331,12 +350,12 @@ model CustomerAddress {
 }
 
 model Lead {
-  id          String    @id @default(uuid())
-  phoneNumber String    @map("phone_number")
-  customerId  String?   @map("customer_id")
-  source      String    @default("WHATSAPP")
-  status      String    @default("NEW")
-  capturedAt  DateTime  @default(now()) @map("captured_at")
+  id          String   @id @default(uuid())
+  phoneNumber String   @map("phone_number")
+  customerId  String?  @map("customer_id")
+  source      String   @default("WHATSAPP")
+  status      String   @default("NEW")
+  capturedAt  DateTime @default(now()) @map("captured_at")
 
   customer Customer? @relation(fields: [customerId], references: [id])
 
@@ -368,11 +387,11 @@ model Message {
 }
 
 model SupportTicket {
-  id          String       @id @default(uuid())
-  customerId  String       @map("customer_id")
-  subject     String
-  status      TicketStatus @default(OPEN)
-  createdAt   DateTime     @default(now()) @map("created_at")
+  id         String       @id @default(uuid())
+  customerId String       @map("customer_id")
+  subject    String
+  status     TicketStatus @default(OPEN)
+  createdAt  DateTime     @default(now()) @map("created_at")
 
   customer Customer @relation(fields: [customerId], references: [id])
 
@@ -423,8 +442,10 @@ model CheckoutSession {
   reservationExpiresAt DateTime              @map("reservation_expires_at")
   createdAt            DateTime              @default(now()) @map("created_at")
 
-  customer        Customer?        @relation(fields: [customerId], references: [id])
+  customer        Customer?              @relation(fields: [customerId], references: [id])
+  reservations    InventoryReservation[]
   paymentAttempts PaymentAttempt[]
+  callbacks       PaymentCallback[]
   order           Order?
 
   @@index([checkoutToken, status])
@@ -436,33 +457,37 @@ model CheckoutSession {
 // ==========================================
 
 model PaymentAttempt {
-  id                 String        @id @default(uuid())
-  checkoutSessionId  String        @map("checkout_session_id")
-  orderId            String?       @map("order_id")
-  merchantRequestId  String?       @unique @map("merchant_request_id")
-  checkoutRequestId  String?       @unique @map("checkout_request_id")
-  phoneNumber        String        @map("phone_number")
-  amountKes          Decimal       @map("amount_kes") @db.Decimal(12, 2)
-  status             PaymentStatus @default(PENDING)
-  initiatedAt        DateTime      @default(now()) @map("initiated_at")
+  id                String        @id @default(uuid())
+  checkoutSessionId String        @map("checkout_session_id")
+  orderId           String?       @map("order_id")
+  paymentMethod     PaymentMethod @default(MPESA_STK) @map("payment_method")
+  merchantRequestId String?       @unique @map("merchant_request_id")
+  checkoutRequestId String?       @unique @map("checkout_request_id")
+  phoneNumber       String        @map("phone_number")
+  amountKes         Decimal       @map("amount_kes") @db.Decimal(12, 2)
+  status            PaymentStatus @default(PENDING)
+  initiatedAt       DateTime      @default(now()) @map("initiated_at")
 
-  checkoutSession     CheckoutSession     @relation(fields: [checkoutSessionId], references: [id])
+  checkoutSession     CheckoutSession      @relation(fields: [checkoutSessionId], references: [id])
+  order               Order?               @relation(fields: [orderId], references: [id])
   paymentTransactions PaymentTransaction[]
+  callbacks           PaymentCallback[]
 
   @@index([checkoutRequestId, merchantRequestId])
   @@map("payment_attempts")
 }
 
 model PaymentTransaction {
-  id                 String   @id @default(uuid())
-  paymentAttemptId   String?  @map("payment_attempt_id")
-  mpesaReceiptNumber String   @unique @map("mpesa_receipt_number")
-  amountKes          Decimal  @map("amount_kes") @db.Decimal(12, 2)
-  phoneNumber        String   @map("phone_number")
-  transactionDate    DateTime @map("transaction_date")
-  resultCode         Int      @map("result_code")
-  resultDesc         String   @map("result_desc")
-  createdAt          DateTime @default(now()) @map("created_at")
+  id                 String        @id @default(uuid())
+  paymentAttemptId   String?       @map("payment_attempt_id")
+  mpesaReceiptNumber String        @unique @map("mpesa_receipt_number")
+  amountKes          Decimal       @map("amount_kes") @db.Decimal(12, 2)
+  phoneNumber        String        @map("phone_number")
+  status             PaymentStatus @default(SUCCESS)
+  transactionDate    DateTime      @map("transaction_date")
+  resultCode         Int           @map("result_code")
+  resultDesc         String        @map("result_desc")
+  createdAt          DateTime      @default(now()) @map("created_at")
 
   paymentAttempt PaymentAttempt?   @relation(fields: [paymentAttemptId], references: [id])
   callbacks      PaymentCallback[]
@@ -471,13 +496,23 @@ model PaymentTransaction {
 }
 
 model PaymentCallback {
-  id                   String   @id @default(uuid())
-  paymentTransactionId String?  @map("payment_transaction_id")
-  rawCallbackJson      Json     @map("raw_callback_json")
-  receivedAt           DateTime @default(now()) @map("received_at")
+  id                   String         @id @default(uuid())
+  checkoutSessionId    String?        @map("checkout_session_id")
+  paymentAttemptId     String?        @map("payment_attempt_id")
+  paymentTransactionId String?        @map("payment_transaction_id")
+  mpesaReceiptNumber   String?        @map("mpesa_receipt_number")
+  status               CallbackStatus @default(RECEIVED)
+  rawCallbackJson      Json           @map("raw_callback_json")
+  receivedAt           DateTime       @default(now()) @map("received_at")
+  processedAt          DateTime?      @map("processed_at")
+  errorMessage         String?        @map("error_message")
 
-  transaction PaymentTransaction? @relation(fields: [paymentTransactionId], references: [id])
+  checkoutSession    CheckoutSession?    @relation(fields: [checkoutSessionId], references: [id])
+  paymentAttempt     PaymentAttempt?     @relation(fields: [paymentAttemptId], references: [id])
+  paymentTransaction PaymentTransaction? @relation(fields: [paymentTransactionId], references: [id])
 
+  @@index([mpesaReceiptNumber])
+  @@index([checkoutSessionId])
   @@map("payment_callbacks")
 }
 
@@ -490,6 +525,7 @@ model Order {
   orderNumber       String        @unique @map("order_number")
   customerId        String        @map("customer_id")
   checkoutSessionId String?       @unique @map("checkout_session_id")
+  paymentMethod     PaymentMethod @default(MPESA_STK) @map("payment_method")
   status            OrderStatus   @default(PENDING_PAYMENT)
   paymentStatus     PaymentStatus @default(PENDING) @map("payment_status")
   subtotalKes       Decimal       @map("subtotal_kes") @db.Decimal(12, 2)
@@ -503,6 +539,7 @@ model Order {
   customer        Customer         @relation(fields: [customerId], references: [id])
   checkoutSession CheckoutSession? @relation(fields: [checkoutSessionId], references: [id])
   items           OrderItem[]
+  paymentAttempts PaymentAttempt[]
   deliveryAddress DeliveryAddress?
   fulfillments    Fulfillment[]
 
@@ -511,16 +548,16 @@ model Order {
 }
 
 model OrderItem {
-  id                 String  @id @default(uuid())
-  orderId            String  @map("order_id")
-  variantId          String  @map("variant_id")
-  skuSnapshot        String  @map("sku_snapshot")
-  productNameSnapshot String @map("product_name_snapshot")
-  sizeSnapshot       String  @map("size_snapshot")
-  colorSnapshot      String  @map("color_snapshot")
-  unitPriceKes       Decimal @map("unit_price_kes") @db.Decimal(12, 2)
-  quantity           Int
-  totalPriceKes      Decimal @map("total_price_kes") @db.Decimal(12, 2)
+  id                  String  @id @default(uuid())
+  orderId             String  @map("order_id")
+  variantId           String  @map("variant_id")
+  skuSnapshot         String  @map("sku_snapshot")
+  productNameSnapshot String  @map("product_name_snapshot")
+  sizeSnapshot        String  @map("size_snapshot")
+  colorSnapshot       String  @map("color_snapshot")
+  unitPriceKes        Decimal @map("unit_price_kes") @db.Decimal(12, 2)
+  quantity            Int
+  totalPriceKes       Decimal @map("total_price_kes") @db.Decimal(12, 2)
 
   order   Order          @relation(fields: [orderId], references: [id], onDelete: Cascade)
   variant ProductVariant @relation(fields: [variantId], references: [id])
@@ -609,7 +646,7 @@ model AuditLog {
 }
 
 model StoreSetting {
-  key         String @id @unique
+  key         String  @id @unique
   value       Json
   description String?
 
