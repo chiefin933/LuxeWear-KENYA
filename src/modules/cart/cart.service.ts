@@ -1,6 +1,7 @@
 import { prisma } from '../../db/prisma.js';
 import { NotFoundError, BadRequestError, ConflictError } from '../../errors/app.error.js';
 import { UpsertCartItemInput } from './cart.schemas.js';
+import { PricingService } from '../catalog/pricing.service.js';
 import { randomUUID } from 'crypto';
 
 /**
@@ -65,8 +66,8 @@ export class CartService {
     const items = cart.items.map((item) => {
       const v = item.variant;
       const p = v.product;
-      const unitPrice = v.priceOverrideKes ?? p.salePriceKes ?? p.basePriceKes;
-      const lineTotal = Number(unitPrice) * item.quantity;
+      const unitPriceDecimal = PricingService.calculateVariantUnitPrice(v);
+      const lineTotalDecimal = unitPriceDecimal.mul(item.quantity);
 
       // Badge — never expose raw stock quantity to the browser
       const qty = v.inventory?.stockQuantity ?? 0;
@@ -84,9 +85,9 @@ export class CartService {
         size: v.size,
         color: v.color,
         thumbnailUrl: p.images[0]?.url ?? null,
-        unitPriceKes: Number(unitPrice),
+        unitPriceKes: unitPriceDecimal.toNumber(),
         quantity: item.quantity,
-        lineTotalKes: lineTotal,
+        lineTotalKes: lineTotalDecimal.toNumber(),
         stockStatus,
         inStock: qty > 0,
       };

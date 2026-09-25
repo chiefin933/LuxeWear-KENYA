@@ -295,6 +295,29 @@ async function run() {
     assert(dbReservations.length === 1, 'idempotency must not double-create reservations');
   });
 
+  await test('POST /checkout/initiate — 409 Conflict when Idempotency-Key reused with different payload', async () => {
+    await cancelReservations(variantId);
+    await resetStock(variantId, 10);
+    const token = await createCartWithItem(variantId, 1);
+    const idempotencyKey = randomUUID();
+    const body1 = { cartToken: token, phoneNumber: '0712345678', deliveryAddress: DELIVERY_ADDRESS };
+    const body2 = { cartToken: token, phoneNumber: '0799999999', deliveryAddress: { ...DELIVERY_ADDRESS, city: 'Mombasa' } };
+
+    const r1 = await request(app)
+      .post('/api/v1/checkout/initiate')
+      .set('Idempotency-Key', idempotencyKey)
+      .send(body1);
+    assert(r1.status === 201, `first request failed: ${r1.status}`);
+
+    const r2 = await request(app)
+      .post('/api/v1/checkout/initiate')
+      .set('Idempotency-Key', idempotencyKey)
+      .send(body2);
+
+    assert(r2.status === 409, `expected 409 Conflict got ${r2.status}`);
+    assert(r2.body.code === 'IDEMPOTENCY_CONFLICT', `expected IDEMPOTENCY_CONFLICT got ${r2.body.code}`);
+  });
+
   await test('POST /checkout/initiate — 400 for empty cart', async () => {
     const emptyCartRes = await request(app).get('/api/v1/cart');
     const res = await request(app).post('/api/v1/checkout/initiate').send({

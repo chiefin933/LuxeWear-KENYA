@@ -5,8 +5,8 @@ import {
   NotFoundError,
 } from '../../errors/app.error.js';
 import { InitiateCheckoutInput } from './checkout.schemas.js';
-import { calculateDeliveryFee } from './delivery-pricing.js';
-import { randomUUID } from 'crypto';
+import { PricingService } from '../catalog/pricing.service.js';
+import { randomUUID, createHash } from 'crypto';
 import { Prisma } from '@prisma/client';
 
 // ─── Business Constants ────────────────────────────────────────────────────
@@ -22,6 +22,19 @@ function normaliseKenyanPhone(raw: string): string {
   if (cleaned.startsWith('254')) return cleaned;
   if (cleaned.startsWith('0')) return `254${cleaned.slice(1)}`;
   return cleaned;
+}
+
+/**
+ * Computes a SHA-256 fingerprint hash for the entire checkout request payload
+ * to guarantee strict idempotency verification across all parameters.
+ */
+function computeRequestFingerprint(input: InitiateCheckoutInput): string {
+  const normalized = {
+    cartToken: input.cartToken,
+    phoneNumber: normaliseKenyanPhone(input.phoneNumber),
+    deliveryAddress: input.deliveryAddress,
+  };
+  return createHash('sha256').update(JSON.stringify(normalized)).digest('hex');
 }
 
 /**
@@ -62,20 +75,21 @@ export class CheckoutService {
    * Atomically:
    *  1. Load the cart and validate it is non-empty.
    *  2. Validate all variants are still active.
-   *  3. Calculate zone-based delivery fee & totals.
+   *  3. Calculate zone-based delivery fee & totals using exact Prisma.Decimal arithmetic via PricingService.
    *  4. Lock inventory rows with SELECT ... FOR UPDATE inside a Serializable transaction with retry.
    *  5. Check per-variant availability.
    *  6. Create the CheckoutSession + InventoryReservations in one transaction.
    *  7. Write an OutboxEvent for n8n to pick up.
    *
    * Idempotent when the same Idempotency-Key is resent — returns the
-   * existing CheckoutSession without re-locking inventory, even under concurrent race conditions.
+   * existing CheckoutSession without re-locking inventory, verifying request payload fingerprint matching.
    */
   static async initiateCheckout(
     input: InitiateCheckoutInput,
     idempotencyKey?: string
   ) {
     const phoneNumber = normaliseKenyanPhone(input.phoneNumber);
+    const requestFingerprint = computeRequestFingerprint(input);
 
     // ── Pre-check Idempotency Guard ──────────────────────────────────────────
     if (idempotencyKey) {
@@ -84,7 +98,14 @@ export class CheckoutService {
         include: { reservations: true },
       });
       if (existing) {
-        // Validate key reuse consistency
+        // Validate request payload fingerprint consistency
+        const storedFingerprint = (existing.deliveryAddressJson as any)?._fingerprint;
+        if (storedFingerprint && storedFingerprint !== requestFingerprint) {
+          throw new ConflictError(
+            'Idempotency-Key reused with different request parameters.',
+            'IDEMPOTENCY_CONFLICT'
+          );
+        }
         if (existing.phoneNumber !== phoneNumber) {
           throw new ConflictError(
             'Idempotency-Key reused with different request parameters.',
@@ -143,22 +164,9 @@ export class CheckoutService {
       );
     }
 
-    // ── 3. Calculate Totals & Zone-Based Delivery Fee ───────────────────────
-    let subtotalNumeric = 0;
-    for (const item of cart.items) {
-      const v = item.variant;
-      const unitPrice = Number(
-        v.priceOverrideKes ?? v.product.salePriceKes ?? v.product.basePriceKes
-      );
-      subtotalNumeric += unitPrice * item.quantity;
-    }
-
-    const deliveryFeeNumeric = calculateDeliveryFee(subtotalNumeric, input.deliveryAddress);
-    const totalPayableNumeric = subtotalNumeric + deliveryFeeNumeric;
-
-    const subtotalKes = new Prisma.Decimal(subtotalNumeric.toFixed(2));
-    const deliveryFeeKes = new Prisma.Decimal(deliveryFeeNumeric.toFixed(2));
-    const totalPayableKes = new Prisma.Decimal(totalPayableNumeric.toFixed(2));
+    // ── 3. Calculate Totals & Zone-Based Delivery Fee using Prisma.Decimal ──
+    const { subtotalKes, deliveryFeeKes, totalPayableKes } =
+      PricingService.calculateCheckoutTotals(cart.items, input.deliveryAddress);
 
     // ── 4 & 5 & 6. Transactional Inventory Lock + Session Creation ──────────
     const checkoutToken = idempotencyKey ?? randomUUID();
@@ -243,12 +251,18 @@ export class CheckoutService {
               );
             }
 
+            // Store delivery address along with SHA-256 payload fingerprint
+            const deliveryAddressJson = {
+              ...input.deliveryAddress,
+              _fingerprint: requestFingerprint,
+            };
+
             // Create CheckoutSession
             const session = await tx.checkoutSession.create({
               data: {
                 checkoutToken,
                 phoneNumber,
-                deliveryAddressJson: input.deliveryAddress as object,
+                deliveryAddressJson: deliveryAddressJson as object,
                 subtotalKes,
                 deliveryFeeKes,
                 totalPayableKes,
@@ -276,6 +290,8 @@ export class CheckoutService {
                   checkoutSessionId: session.id,
                   checkoutToken,
                   phoneNumber,
+                  subtotalKes: subtotalKes.toFixed(2),
+                  deliveryFeeKes: deliveryFeeKes.toFixed(2),
                   totalPayableKes: totalPayableKes.toFixed(2),
                   reservationExpiresAt: expiresAt.toISOString(),
                   itemCount: cart.items.length,
@@ -299,6 +315,13 @@ export class CheckoutService {
           include: { reservations: true },
         });
         if (winningSession) {
+          const storedFingerprint = (winningSession.deliveryAddressJson as any)?._fingerprint;
+          if (storedFingerprint && storedFingerprint !== requestFingerprint) {
+            throw new ConflictError(
+              'Idempotency-Key reused with different request parameters.',
+              'IDEMPOTENCY_CONFLICT'
+            );
+          }
           return this.formatCheckoutResponse(winningSession);
         }
       }
@@ -318,12 +341,15 @@ export class CheckoutService {
 
   // ─── Format response ─────────────────────────────────────────────────────
   private static formatCheckoutResponse(session: any) {
+    const delAddr = { ...session.deliveryAddressJson };
+    delete delAddr._fingerprint; // Clean up internal fingerprint from public API response
+
     return {
       checkoutSessionId: session.id,
       checkoutToken: session.checkoutToken,
       status: session.status,
       phoneNumber: session.phoneNumber,
-      deliveryAddress: session.deliveryAddressJson,
+      deliveryAddress: delAddr,
       subtotalKes: Number(session.subtotalKes),
       deliveryFeeKes: Number(session.deliveryFeeKes),
       totalPayableKes: Number(session.totalPayableKes),

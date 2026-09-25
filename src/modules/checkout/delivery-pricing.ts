@@ -1,3 +1,11 @@
+export type DeliveryZone = 'NAIROBI_METRO' | 'GREATER_NAIROBI' | 'NATIONWIDE';
+
+export interface DeliveryAddressLocation {
+  city?: string;
+  suburbArea?: string;
+  deliveryZone?: DeliveryZone | string;
+}
+
 /**
  * LuxeWear Kenya Delivery Pricing Calculator
  *
@@ -9,13 +17,22 @@
  */
 export function calculateDeliveryFee(
   subtotalKes: number,
-  deliveryAddress: { city?: string; suburbArea?: string }
+  deliveryAddress: DeliveryAddressLocation
 ): number {
   // Free delivery for orders KES 7,500 and above
   if (subtotalKes >= 7500) {
     return 0;
   }
 
+  // 1. Explicit deliveryZone matching if specified
+  if (deliveryAddress.deliveryZone) {
+    const zoneStr = deliveryAddress.deliveryZone.toUpperCase().trim();
+    if (zoneStr === 'NAIROBI_METRO' || zoneStr === 'ZONE_1') return 300;
+    if (zoneStr === 'GREATER_NAIROBI' || zoneStr === 'ZONE_2') return 400;
+    if (zoneStr === 'NATIONWIDE' || zoneStr === 'ZONE_3') return 500;
+  }
+
+  // 2. Text matching fallback on city & suburbArea
   const city = (deliveryAddress.city || '').toLowerCase().trim();
   const suburb = (deliveryAddress.suburbArea || '').toLowerCase().trim();
 
