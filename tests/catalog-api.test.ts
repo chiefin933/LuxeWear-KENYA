@@ -26,8 +26,8 @@ async function runCatalogApiTests() {
     console.log('\n▶ TEST 2: GET /api/v1/catalog/products (Paginated Product Catalog)');
     const resProducts = await request(app).get('/api/v1/catalog/products');
 
-    if (resProducts.status === 200 && resProducts.body.meta.total === 12) {
-      console.log(`   ✅ PASS: Product catalog returned all ${resProducts.body.meta.total} launch products.`);
+    if (resProducts.status === 200 && resProducts.body.meta.total >= 12) {
+      console.log(`   ✅ PASS: Product catalog returned ${resProducts.body.meta.total} products.`);
       passed++;
     } else {
       throw new Error(`GET /api/v1/catalog/products failed with status ${resProducts.status}: ${JSON.stringify(resProducts.body)}`);

@@ -11,6 +11,7 @@ import { authRouter } from './modules/auth/auth.routes.js';
 import { catalogRouter } from './modules/catalog/catalog.routes.js';
 import { cartRouter } from './modules/cart/cart.routes.js';
 import { checkoutRouter } from './modules/checkout/checkout.routes.js';
+import { paymentRouter } from './modules/payment/payment.routes.js';
 import { authenticateJwt } from './middleware/auth.middleware.js';
 import { requireRole, requirePermission } from './middleware/rbac.middleware.js';
 import { RoleName } from '@prisma/client';
@@ -52,6 +53,7 @@ v1Router.use('/auth', authRouter);
 v1Router.use('/catalog', catalogRouter);
 v1Router.use('/cart', cartRouter);
 v1Router.use('/checkout', checkoutRouter);
+v1Router.use('/payments', paymentRouter);
 
 // Sample Protected RBAC Route for Testing Role Guards
 v1Router.get('/admin/super-only', authenticateJwt, requireRole([RoleName.SUPER_ADMIN]), (_req: Request, res: Response) => {
