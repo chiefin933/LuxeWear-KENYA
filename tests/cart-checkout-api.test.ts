@@ -8,6 +8,7 @@
 import request from 'supertest';
 import { app } from '../src/app.js';
 import { prisma } from '../src/db/prisma.js';
+import { calculateDeliveryFee } from '../src/modules/checkout/delivery-pricing.js';
 import { randomUUID } from 'crypto';
 
 // ─── Fixtures ─────────────────────────────────────────────────────────────────
@@ -233,9 +234,14 @@ async function run() {
   console.log('\n─── Checkout API ────────────────────────────────────────────────\n');
 
   await test('POST /checkout/initiate — happy path creates session & reservations', async () => {
-    await cancelReservations(variantId);
-    await resetStock(variantId, 10);
-    const token = await createCartWithItem(variantId, 2);
+    const cheapVariant = await prisma.productVariant.findFirst({
+      where: { sku: { startsWith: 'LW-W-TOP-01' } },
+    });
+    assert(cheapVariant !== null, 'cheapVariant must exist');
+
+    await cancelReservations(cheapVariant!.id);
+    await resetStock(cheapVariant!.id, 10);
+    const token = await createCartWithItem(cheapVariant!.id, 1); // 4,500 KES < 7,500 KES threshold
 
     const res = await request(app).post('/api/v1/checkout/initiate').send({
       cartToken: token,
@@ -247,8 +253,8 @@ async function run() {
     assert(res.body.success === true, 'success must be true');
     assert(typeof res.body.data.checkoutToken === 'string', 'checkoutToken must exist');
     assert(res.body.data.status === 'ACTIVE', 'status must be ACTIVE');
-    assert(res.body.data.deliveryFeeKes === 200, 'delivery fee must be KES 200');
-    assert(res.body.data.totalPayableKes > 0, 'totalPayable must be positive');
+    assert(res.body.data.deliveryFeeKes === 300, 'delivery fee must be KES 300 for Nairobi Kilimani');
+    assert(res.body.data.totalPayableKes === 4800, 'totalPayable must be 4800 (4500 + 300)');
     assert(res.body.data.reservationCount === 1, 'must have 1 reservation');
 
     // Verify reservation is actually in the database
@@ -256,7 +262,7 @@ async function run() {
       where: { checkoutSessionId: res.body.data.checkoutSessionId, status: 'ACTIVE' },
     });
     assert(dbReservations.length === 1, 'DB must have 1 ACTIVE reservation');
-    assert(dbReservations[0].quantity === 2, 'reservation quantity must be 2');
+    assert(dbReservations[0].quantity === 1, 'reservation quantity must be 1');
   });
 
   await test('POST /checkout/initiate — idempotent with same Idempotency-Key', async () => {
@@ -352,8 +358,8 @@ async function run() {
         phoneNumber: '254711111111',
         deliveryAddressJson: DELIVERY_ADDRESS,
         subtotalKes: 5000,
-        deliveryFeeKes: 200,
-        totalPayableKes: 5200,
+        deliveryFeeKes: 300,
+        totalPayableKes: 5300,
         status: 'ACTIVE',
         reservationExpiresAt: new Date(Date.now() + 15 * 60 * 1000),
         reservations: {
@@ -443,6 +449,81 @@ async function run() {
     assert(event!.status === 'PENDING', `event status must be PENDING, got ${event!.status}`);
     const payload = event!.payload as any;
     assert(payload.checkoutSessionId === res.body.data.checkoutSessionId, 'payload must contain checkoutSessionId');
+  });
+
+  await test('POST /checkout/initiate — concurrent race condition with identical Idempotency-Key', async () => {
+    await cancelReservations(variantId);
+    await resetStock(variantId, 10);
+    const token = await createCartWithItem(variantId, 1);
+    const idempotencyKey = randomUUID();
+    const body = { cartToken: token, phoneNumber: '0712345678', deliveryAddress: DELIVERY_ADDRESS };
+
+    // Fire 3 simultaneous concurrent requests with the identical Idempotency-Key
+    const results = await Promise.all([
+      request(app).post('/api/v1/checkout/initiate').set('Idempotency-Key', idempotencyKey).send(body),
+      request(app).post('/api/v1/checkout/initiate').set('Idempotency-Key', idempotencyKey).send(body),
+      request(app).post('/api/v1/checkout/initiate').set('Idempotency-Key', idempotencyKey).send(body),
+    ]);
+
+    for (const r of results) {
+      assert(r.status === 201, `concurrent request expected 201 got ${r.status}`);
+    }
+
+    const firstSessionId = results[0].body.data.checkoutSessionId;
+    assert(
+      results.every((r) => r.body.data.checkoutSessionId === firstSessionId),
+      'all concurrent requests must resolve to the identical checkout session ID'
+    );
+
+    const dbReservations = await prisma.inventoryReservation.findMany({
+      where: { checkoutSessionId: firstSessionId, status: 'ACTIVE' },
+    });
+    assert(dbReservations.length === 1, 'concurrent race must not double-create reservations');
+  });
+
+  await test('POST /checkout/initiate — delivery fee zone rates & free delivery threshold', async () => {
+    // Direct unit assertions of calculateDeliveryFee helper
+    assert(calculateDeliveryFee(4500, { city: 'Nairobi', suburbArea: 'Kilimani' }) === 300, 'Zone 1 Nairobi Metro must be 300 KES for orders < 7,500');
+    assert(calculateDeliveryFee(4500, { city: 'Thika', suburbArea: 'Section 9' }) === 400, 'Zone 2 Greater Nairobi must be 400 KES for orders < 7,500');
+    assert(calculateDeliveryFee(4500, { city: 'Mombasa', suburbArea: 'Nyali' }) === 500, 'Zone 3 Nationwide must be 500 KES for orders < 7,500');
+    assert(calculateDeliveryFee(8500, { city: 'Mombasa', suburbArea: 'Nyali' }) === 0, 'Orders KES 7,500+ receive free delivery (0 KES)');
+
+    // Integration check via API
+    await cancelReservations(variantId);
+    await resetStock(variantId, 10);
+
+    const cheapVariant = await prisma.productVariant.findFirst({
+      where: { sku: { startsWith: 'LW-W-TOP-01' } },
+    });
+    assert(cheapVariant !== null, 'cheapVariant must exist');
+
+    // Zone 2 Greater Nairobi (Thika) with 4,500 KES item
+    const token1 = await createCartWithItem(cheapVariant!.id, 1);
+    const resThika = await request(app).post('/api/v1/checkout/initiate').send({
+      cartToken: token1,
+      phoneNumber: '0712345678',
+      deliveryAddress: { ...DELIVERY_ADDRESS, city: 'Thika', suburbArea: 'Section 9' },
+    });
+    assert(resThika.body.data.deliveryFeeKes === 400, 'Zone 2 Greater Nairobi delivery fee must be KES 400');
+
+    // Zone 3 Nationwide (Mombasa) with 4,500 KES item
+    const token2 = await createCartWithItem(cheapVariant!.id, 1);
+    const resMombasa = await request(app).post('/api/v1/checkout/initiate').send({
+      cartToken: token2,
+      phoneNumber: '0712345678',
+      deliveryAddress: { ...DELIVERY_ADDRESS, city: 'Mombasa', suburbArea: 'Nyali' },
+    });
+    assert(resMombasa.body.data.deliveryFeeKes === 500, 'Zone 3 Nationwide delivery fee must be KES 500');
+
+    // Free Delivery Threshold (Subtotal >= KES 7,500) — 8,500 KES item
+    const token3 = await createCartWithItem(variantId, 1);
+    const resFree = await request(app).post('/api/v1/checkout/initiate').send({
+      cartToken: token3,
+      phoneNumber: '0712345678',
+      deliveryAddress: { ...DELIVERY_ADDRESS, city: 'Mombasa', suburbArea: 'Nyali' },
+    });
+    assert(resFree.body.data.deliveryFeeKes === 0, 'Orders KES 7,500+ must receive free delivery (KES 0)');
+    assert(resFree.body.data.totalPayableKes === resFree.body.data.subtotalKes, 'totalPayable must equal subtotal for free delivery');
   });
 
   // ─── Summary ───────────────────────────────────────────────────────────────

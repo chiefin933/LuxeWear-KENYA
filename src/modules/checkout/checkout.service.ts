@@ -5,12 +5,12 @@ import {
   NotFoundError,
 } from '../../errors/app.error.js';
 import { InitiateCheckoutInput } from './checkout.schemas.js';
+import { calculateDeliveryFee } from './delivery-pricing.js';
 import { randomUUID } from 'crypto';
 import { Prisma } from '@prisma/client';
 
 // ─── Business Constants ────────────────────────────────────────────────────
 const RESERVATION_TTL_MINUTES = 15;
-const DELIVERY_FEE_KES = 200; // Flat-rate Nairobi delivery
 
 /**
  * Normalise a Kenyan phone number to the international 254XXXXXXXXX format.
@@ -24,6 +24,37 @@ function normaliseKenyanPhone(raw: string): string {
   return cleaned;
 }
 
+/**
+ * Executes a transaction block with bounded exponential retry for PostgreSQL
+ * SERIALIZABLE isolation failures (P2034 / SQLSTATE 40001).
+ */
+async function withSerializableRetry<T>(
+  fn: () => Promise<T>,
+  maxRetries = 3,
+  baseDelayMs = 50
+): Promise<T> {
+  let attempt = 0;
+  while (attempt < maxRetries) {
+    try {
+      return await fn();
+    } catch (err: any) {
+      attempt++;
+      const isSerializationError =
+        err?.code === 'P2034' ||
+        err?.message?.includes('serialization') ||
+        err?.message?.includes('could not serialize access');
+
+      if (isSerializationError && attempt < maxRetries) {
+        const jitter = Math.floor(Math.random() * 30);
+        await new Promise((resolve) => setTimeout(resolve, baseDelayMs * attempt + jitter));
+        continue;
+      }
+      throw err;
+    }
+  }
+  throw new Error('Transaction failed after maximum retries');
+}
+
 export class CheckoutService {
   /**
    * POST /api/v1/checkout/initiate
@@ -31,25 +62,35 @@ export class CheckoutService {
    * Atomically:
    *  1. Load the cart and validate it is non-empty.
    *  2. Validate all variants are still active.
-   *  3. Lock inventory rows with SELECT ... FOR UPDATE.
-   *  4. Check per-variant availability.
-   *  5. Create the CheckoutSession + InventoryReservations in one transaction.
-   *  6. Write an OutboxEvent for n8n to pick up.
+   *  3. Calculate zone-based delivery fee & totals.
+   *  4. Lock inventory rows with SELECT ... FOR UPDATE inside a Serializable transaction with retry.
+   *  5. Check per-variant availability.
+   *  6. Create the CheckoutSession + InventoryReservations in one transaction.
+   *  7. Write an OutboxEvent for n8n to pick up.
    *
    * Idempotent when the same Idempotency-Key is resent — returns the
-   * existing CheckoutSession without re-locking inventory.
+   * existing CheckoutSession without re-locking inventory, even under concurrent race conditions.
    */
   static async initiateCheckout(
     input: InitiateCheckoutInput,
     idempotencyKey?: string
   ) {
-    // ── Idempotency Guard ──────────────────────────────────────────────────
+    const phoneNumber = normaliseKenyanPhone(input.phoneNumber);
+
+    // ── Pre-check Idempotency Guard ──────────────────────────────────────────
     if (idempotencyKey) {
       const existing = await prisma.checkoutSession.findUnique({
         where: { checkoutToken: idempotencyKey },
         include: { reservations: true },
       });
       if (existing) {
+        // Validate key reuse consistency
+        if (existing.phoneNumber !== phoneNumber) {
+          throw new ConflictError(
+            'Idempotency-Key reused with different request parameters.',
+            'IDEMPOTENCY_CONFLICT'
+          );
+        }
         return this.formatCheckoutResponse(existing);
       }
     }
@@ -73,9 +114,6 @@ export class CheckoutService {
                   },
                 },
                 inventory: { select: { stockQuantity: true } },
-                // priceOverrideKes is required for correct per-variant pricing
-                // (Prisma includes all scalar fields by default in `include`, so
-                //  this is already present — but made explicit here for clarity)
               },
             },
           },
@@ -105,140 +143,167 @@ export class CheckoutService {
       );
     }
 
-    // ── 3 & 4 & 5. Transactional Inventory Lock + Session Creation ──────────
+    // ── 3. Calculate Totals & Zone-Based Delivery Fee ───────────────────────
+    let subtotalNumeric = 0;
+    for (const item of cart.items) {
+      const v = item.variant;
+      const unitPrice = Number(
+        v.priceOverrideKes ?? v.product.salePriceKes ?? v.product.basePriceKes
+      );
+      subtotalNumeric += unitPrice * item.quantity;
+    }
+
+    const deliveryFeeNumeric = calculateDeliveryFee(subtotalNumeric, input.deliveryAddress);
+    const totalPayableNumeric = subtotalNumeric + deliveryFeeNumeric;
+
+    const subtotalKes = new Prisma.Decimal(subtotalNumeric.toFixed(2));
+    const deliveryFeeKes = new Prisma.Decimal(deliveryFeeNumeric.toFixed(2));
+    const totalPayableKes = new Prisma.Decimal(totalPayableNumeric.toFixed(2));
+
+    // ── 4 & 5 & 6. Transactional Inventory Lock + Session Creation ──────────
     const checkoutToken = idempotencyKey ?? randomUUID();
     const expiresAt = new Date(Date.now() + RESERVATION_TTL_MINUTES * 60 * 1000);
-    const phoneNumber = normaliseKenyanPhone(input.phoneNumber);
 
     let checkoutSession: Awaited<ReturnType<typeof prisma.checkoutSession.findUniqueOrThrow>>;
 
     try {
-      checkoutSession = await prisma.$transaction(
-        async (tx) => {
-          // Lock all inventory rows for this checkout in a deterministic order
-          // (order by variantId to prevent deadlocks between concurrent checkouts)
-          const sortedItems = [...cart.items].sort((a, b) =>
-            a.variantId.localeCompare(b.variantId)
-          );
-
-          // SELECT ... FOR UPDATE on each inventory row
-          const stockMap: Record<string, number> = {};
-          for (const item of sortedItems) {
-            const inv = await tx.$queryRaw<{ stock_quantity: number }[]>`
-              SELECT stock_quantity
-              FROM inventory
-              WHERE variant_id::text = ${item.variantId}
-              FOR UPDATE
-            `;
-
-            if (!inv.length) {
-              throw new ConflictError(
-                `Inventory record missing for variant ${item.variantId}.`,
-                'INVENTORY_NOT_FOUND'
-              );
+      checkoutSession = await withSerializableRetry(async () => {
+        return prisma.$transaction(
+          async (tx) => {
+            // Check for concurrent session creation inside transaction if idempotencyKey was provided
+            if (idempotencyKey) {
+              const insideExisting = await tx.checkoutSession.findUnique({
+                where: { checkoutToken: idempotencyKey },
+                include: { reservations: true },
+              });
+              if (insideExisting) {
+                return insideExisting;
+              }
             }
 
-            stockMap[item.variantId] = inv[0].stock_quantity;
-          }
-
-          // Count existing ACTIVE reservations for each variant
-          const activeReservations = await tx.inventoryReservation.groupBy({
-            by: ['variantId'],
-            where: {
-              variantId: { in: sortedItems.map((i) => i.variantId) },
-              status: 'ACTIVE',
-              expiresAt: { gt: new Date() },
-            },
-            _sum: { quantity: true },
-          });
-
-          const reservedMap: Record<string, number> = {};
-          for (const r of activeReservations) {
-            reservedMap[r.variantId] = r._sum.quantity ?? 0;
-          }
-
-          // Check each item for sufficient free stock
-          const insufficientItems: string[] = [];
-          for (const item of sortedItems) {
-            const stock = stockMap[item.variantId] ?? 0;
-            const reserved = reservedMap[item.variantId] ?? 0;
-            const freeStock = stock - reserved;
-
-            if (freeStock < item.quantity) {
-              insufficientItems.push(
-                `${item.variant.product.name} (${item.variant.size}/${item.variant.color}): ` +
-                  `requested ${item.quantity}, only ${Math.max(0, freeStock)} available`
-              );
-            }
-          }
-
-          if (insufficientItems.length > 0) {
-            throw new ConflictError(
-              `Insufficient stock for: ${insufficientItems.join('; ')}`,
-              'INSUFFICIENT_STOCK'
+            // Lock all inventory rows for this checkout in deterministic variantId order
+            const sortedItems = [...cart.items].sort((a, b) =>
+              a.variantId.localeCompare(b.variantId)
             );
-          }
 
-          // Compute totals
-          let subtotalKes = new Prisma.Decimal(0);
-          for (const item of sortedItems) {
-            const v = item.variant;
-            const unitPrice =
-              v.priceOverrideKes ?? v.product.salePriceKes ?? v.product.basePriceKes;
-            subtotalKes = subtotalKes.add(new Prisma.Decimal(unitPrice.toString()).mul(item.quantity));
-          }
-          const deliveryFeeKes = new Prisma.Decimal(DELIVERY_FEE_KES);
-          const totalPayableKes = subtotalKes.add(deliveryFeeKes);
+            const stockMap: Record<string, number> = {};
+            for (const item of sortedItems) {
+              const inv = await tx.$queryRaw<{ stock_quantity: number }[]>`
+                SELECT stock_quantity
+                FROM inventory
+                WHERE variant_id::text = ${item.variantId}
+                FOR UPDATE
+              `;
 
-          // Create CheckoutSession
-          const session = await tx.checkoutSession.create({
-            data: {
-              checkoutToken,
-              phoneNumber,
-              deliveryAddressJson: input.deliveryAddress as object,
-              subtotalKes,
-              deliveryFeeKes,
-              totalPayableKes,
-              status: 'ACTIVE',
-              reservationExpiresAt: expiresAt,
-              reservations: {
-                create: sortedItems.map((item) => ({
-                  variantId: item.variantId,
-                  quantity: item.quantity,
-                  status: 'ACTIVE',
-                  expiresAt,
-                })),
+              if (!inv.length) {
+                throw new ConflictError(
+                  `Inventory record missing for variant ${item.variantId}.`,
+                  'INVENTORY_NOT_FOUND'
+                );
+              }
+
+              stockMap[item.variantId] = inv[0].stock_quantity;
+            }
+
+            // Count existing ACTIVE reservations for each variant
+            const activeReservations = await tx.inventoryReservation.groupBy({
+              by: ['variantId'],
+              where: {
+                variantId: { in: sortedItems.map((i) => i.variantId) },
+                status: 'ACTIVE',
+                expiresAt: { gt: new Date() },
               },
-            },
-            include: { reservations: true },
-          });
+              _sum: { quantity: true },
+            });
 
-          // Write OutboxEvent for n8n to process (checkout.initiated)
-          await tx.outboxEvent.create({
-            data: {
-              eventType: 'checkout.initiated',
-              aggregateType: 'CheckoutSession',
-              aggregateId: session.id,
-              payload: {
-                checkoutSessionId: session.id,
+            const reservedMap: Record<string, number> = {};
+            for (const r of activeReservations) {
+              reservedMap[r.variantId] = r._sum.quantity ?? 0;
+            }
+
+            // Check each item for sufficient free stock
+            const insufficientItems: string[] = [];
+            for (const item of sortedItems) {
+              const stock = stockMap[item.variantId] ?? 0;
+              const reserved = reservedMap[item.variantId] ?? 0;
+              const freeStock = stock - reserved;
+
+              if (freeStock < item.quantity) {
+                insufficientItems.push(
+                  `${item.variant.product.name} (${item.variant.size}/${item.variant.color}): ` +
+                    `requested ${item.quantity}, only ${Math.max(0, freeStock)} available`
+                );
+              }
+            }
+
+            if (insufficientItems.length > 0) {
+              throw new ConflictError(
+                `Insufficient stock for: ${insufficientItems.join('; ')}`,
+                'INSUFFICIENT_STOCK'
+              );
+            }
+
+            // Create CheckoutSession
+            const session = await tx.checkoutSession.create({
+              data: {
                 checkoutToken,
                 phoneNumber,
-                totalPayableKes: totalPayableKes.toFixed(2),
-                reservationExpiresAt: expiresAt.toISOString(),
-                itemCount: cart.items.length,
+                deliveryAddressJson: input.deliveryAddress as object,
+                subtotalKes,
+                deliveryFeeKes,
+                totalPayableKes,
+                status: 'ACTIVE',
+                reservationExpiresAt: expiresAt,
+                reservations: {
+                  create: sortedItems.map((item) => ({
+                    variantId: item.variantId,
+                    quantity: item.quantity,
+                    status: 'ACTIVE',
+                    expiresAt,
+                  })),
+                },
               },
-            },
-          });
+              include: { reservations: true },
+            });
 
-          return session;
-        },
-        {
-          isolationLevel: Prisma.TransactionIsolationLevel.Serializable,
-          timeout: 10_000,
-        }
-      );
+            // Write OutboxEvent for n8n automation (checkout.initiated)
+            await tx.outboxEvent.create({
+              data: {
+                eventType: 'checkout.initiated',
+                aggregateType: 'CheckoutSession',
+                aggregateId: session.id,
+                payload: {
+                  checkoutSessionId: session.id,
+                  checkoutToken,
+                  phoneNumber,
+                  totalPayableKes: totalPayableKes.toFixed(2),
+                  reservationExpiresAt: expiresAt.toISOString(),
+                  itemCount: cart.items.length,
+                },
+              },
+            });
+
+            return session;
+          },
+          {
+            isolationLevel: Prisma.TransactionIsolationLevel.Serializable,
+            timeout: 10_000,
+          }
+        );
+      });
     } catch (err: any) {
-      // Re-wrap Prisma serialization failures (P2034) into our typed error
+      // Catch concurrent unique constraint violation on checkoutToken (P2002)
+      if (err?.code === 'P2002' && idempotencyKey) {
+        const winningSession = await prisma.checkoutSession.findUnique({
+          where: { checkoutToken: idempotencyKey },
+          include: { reservations: true },
+        });
+        if (winningSession) {
+          return this.formatCheckoutResponse(winningSession);
+        }
+      }
+
+      // Re-wrap Prisma serialization failures (P2034) if retries exhausted
       if (err?.code === 'P2034' || err?.message?.includes('serialization')) {
         throw new ConflictError(
           'Checkout could not be completed due to concurrent demand. Please try again.',
