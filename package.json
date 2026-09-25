@@ -17,7 +17,8 @@
     "test:db": "npx tsx tests/db-invariants.test.ts",
     "test:foundation": "npx tsx tests/backend-foundation.test.ts",
     "test:auth": "npx tsx tests/auth-rbac.test.ts",
-    "test:catalog": "npx tsx tests/catalog-api.test.ts"
+    "test:catalog": "npx tsx tests/catalog-api.test.ts",
+    "test:checkout": "npx tsx tests/cart-checkout-api.test.ts"
   },
   "prisma": {
     "seed": "npx tsx prisma/seed.ts"

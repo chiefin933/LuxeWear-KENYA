@@ -9,11 +9,13 @@ export const validate = (schema: AnyZodObject) => {
         body: req.body,
         query: req.query,
         params: req.params,
+        headers: req.headers,
       });
 
       req.body = parsed.body || req.body;
       req.query = parsed.query || req.query;
       req.params = parsed.params || req.params;
+      // headers are not re-assigned — they are validated-only (read from req.headers directly)
 
       next();
     } catch (error) {

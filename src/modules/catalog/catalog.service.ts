@@ -1,24 +1,15 @@
 import { prisma } from '../../db/prisma.js';
 import { NotFoundError } from '../../errors/app.error.js';
-
-export interface ProductFilterParams {
-  page?: number;
-  limit?: number;
-  categorySlug?: string;
-  size?: string;
-  color?: string;
-  minPrice?: number;
-  maxPrice?: number;
-  isFeatured?: boolean;
-  search?: string;
-}
+import { GetProductsQueryInput } from './catalog.schemas.js';
 
 export class CatalogService {
   static async getCategories() {
     const rootCategories = await prisma.category.findMany({
       where: { parentId: null },
       include: {
-        children: true,
+        children: {
+          select: { id: true, name: true, slug: true, description: true },
+        },
       },
       orderBy: { name: 'asc' },
     });
@@ -26,9 +17,9 @@ export class CatalogService {
     return rootCategories;
   }
 
-  static async getProducts(params: ProductFilterParams) {
-    const page = params.page && params.page > 0 ? params.page : 1;
-    const limit = params.limit && params.limit > 0 ? params.limit : 20;
+  static async getProducts(params: GetProductsQueryInput) {
+    const page = params.page || 1;
+    const limit = params.limit || 20;
     const skip = (page - 1) * limit;
 
     const where: any = {
@@ -43,13 +34,15 @@ export class CatalogService {
     if (params.categorySlug) {
       const category = await prisma.category.findUnique({
         where: { slug: params.categorySlug },
-        include: { children: true },
+        include: { children: { select: { id: true } } },
       });
 
-      if (category) {
-        const categoryIds = [category.id, ...category.children.map((c) => c.id)];
-        where.categoryId = { in: categoryIds };
+      if (!category) {
+        throw new NotFoundError(`Category '${params.categorySlug}' not found.`);
       }
+
+      const categoryIds = [category.id, ...category.children.map((c) => c.id)];
+      where.categoryId = { in: categoryIds };
     }
 
     if (params.search) {
@@ -59,10 +52,28 @@ export class CatalogService {
       ];
     }
 
+    // Effective Price Filtering: Check both basePriceKes and salePriceKes
     if (params.minPrice !== undefined || params.maxPrice !== undefined) {
-      where.basePriceKes = {};
-      if (params.minPrice !== undefined) where.basePriceKes.gte = params.minPrice;
-      if (params.maxPrice !== undefined) where.basePriceKes.lte = params.maxPrice;
+      const priceConditions: any[] = [];
+
+      if (params.minPrice !== undefined && params.maxPrice !== undefined) {
+        priceConditions.push(
+          { basePriceKes: { gte: params.minPrice, lte: params.maxPrice } },
+          { salePriceKes: { gte: params.minPrice, lte: params.maxPrice } }
+        );
+      } else if (params.minPrice !== undefined) {
+        priceConditions.push(
+          { basePriceKes: { gte: params.minPrice } },
+          { salePriceKes: { gte: params.minPrice } }
+        );
+      } else if (params.maxPrice !== undefined) {
+        priceConditions.push(
+          { basePriceKes: { lte: params.maxPrice } },
+          { salePriceKes: { lte: params.maxPrice } }
+        );
+      }
+
+      where.OR = where.OR ? [...where.OR, ...priceConditions] : priceConditions;
     }
 
     if (params.size || params.color) {
@@ -81,14 +92,30 @@ export class CatalogService {
         where,
         skip,
         take: limit,
-        include: {
-          category: true,
+        select: {
+          id: true,
+          name: true,
+          slug: true,
+          description: true,
+          basePriceKes: true,
+          salePriceKes: true,
+          isFeatured: true,
+          category: {
+            select: { id: true, name: true, slug: true },
+          },
           images: {
+            take: 2,
             orderBy: [{ isThumbnail: 'desc' }, { displayOrder: 'asc' }],
+            select: { id: true, url: true, altText: true, isThumbnail: true },
           },
           variants: {
             where: { isActive: true, deletedAt: null },
-            include: { inventory: true },
+            select: {
+              id: true,
+              size: true,
+              color: true,
+              inventory: { select: { stockQuantity: true } },
+            },
           },
         },
         orderBy: { createdAt: 'desc' },
@@ -96,19 +123,25 @@ export class CatalogService {
       prisma.product.count({ where }),
     ]);
 
-    const formattedProducts = products.map((p) => ({
-      id: p.id,
-      name: p.name,
-      slug: p.slug,
-      description: p.description,
-      basePriceKes: p.basePriceKes,
-      salePriceKes: p.salePriceKes,
-      category: { id: p.category.id, name: p.category.name, slug: p.category.slug },
-      isFeatured: p.isFeatured,
-      images: p.images,
-      variantsCount: p.variants.length,
-      inStock: p.variants.some((v) => (v.inventory?.stockQuantity || 0) > 0),
-    }));
+    const formattedProducts = products.map((p) => {
+      const inStock = p.variants.some((v) => (v.inventory?.stockQuantity || 0) > 0);
+      return {
+        id: p.id,
+        name: p.name,
+        slug: p.slug,
+        description: p.description,
+        basePriceKes: p.basePriceKes,
+        salePriceKes: p.salePriceKes,
+        effectivePriceKes: p.salePriceKes || p.basePriceKes,
+        category: p.category,
+        isFeatured: p.isFeatured,
+        thumbnailUrl: p.images[0]?.url || null,
+        images: p.images,
+        availableSizes: Array.from(new Set(p.variants.map((v) => v.size))),
+        availableColors: Array.from(new Set(p.variants.map((v) => v.color))),
+        inStock,
+      };
+    });
 
     return {
       products: formattedProducts,
@@ -125,14 +158,21 @@ export class CatalogService {
     const product = await prisma.product.findUnique({
       where: { slug },
       include: {
-        category: true,
+        category: { select: { id: true, name: true, slug: true } },
         images: {
           orderBy: [{ isThumbnail: 'desc' }, { displayOrder: 'asc' }],
+          select: { id: true, url: true, altText: true, isThumbnail: true },
         },
         variants: {
           where: { isActive: true, deletedAt: null },
-          include: {
-            inventory: true,
+          select: {
+            id: true,
+            sku: true,
+            size: true,
+            color: true,
+            colorHex: true,
+            priceOverrideKes: true,
+            inventory: { select: { stockQuantity: true, safetyStockThreshold: true } },
           },
         },
       },
@@ -142,17 +182,28 @@ export class CatalogService {
       throw new NotFoundError(`Product '${slug}' not found.`);
     }
 
-    const variants = product.variants.map((v) => ({
-      id: v.id,
-      sku: v.sku,
-      size: v.size,
-      color: v.color,
-      colorHex: v.colorHex,
-      priceOverrideKes: v.priceOverrideKes,
-      effectivePriceKes: v.priceOverrideKes || product.salePriceKes || product.basePriceKes,
-      stockQuantity: v.inventory?.stockQuantity || 0,
-      inStock: (v.inventory?.stockQuantity || 0) > 0,
-    }));
+    const variants = product.variants.map((v) => {
+      const qty = v.inventory?.stockQuantity || 0;
+      let stockStatus: 'IN_STOCK' | 'LOW_STOCK' | 'OUT_OF_STOCK' = 'OUT_OF_STOCK';
+
+      if (qty > (v.inventory?.safetyStockThreshold || 3)) {
+        stockStatus = 'IN_STOCK';
+      } else if (qty > 0) {
+        stockStatus = 'LOW_STOCK';
+      }
+
+      return {
+        id: v.id,
+        sku: v.sku,
+        size: v.size,
+        color: v.color,
+        colorHex: v.colorHex,
+        priceOverrideKes: v.priceOverrideKes,
+        effectivePriceKes: v.priceOverrideKes || product.salePriceKes || product.basePriceKes,
+        inStock: qty > 0,
+        stockStatus,
+      };
+    });
 
     return {
       id: product.id,
@@ -162,11 +213,8 @@ export class CatalogService {
       fabricCare: product.fabricCare,
       basePriceKes: product.basePriceKes,
       salePriceKes: product.salePriceKes,
-      category: {
-        id: product.category.id,
-        name: product.category.name,
-        slug: product.category.slug,
-      },
+      effectivePriceKes: product.salePriceKes || product.basePriceKes,
+      category: product.category,
       isFeatured: product.isFeatured,
       images: product.images,
       variants,

@@ -1,5 +1,6 @@
 import { Request, Response, NextFunction } from 'express';
 import { CatalogService } from './catalog.service.js';
+import { GetProductsQueryInput } from './catalog.schemas.js';
 
 export class CatalogController {
   static async getCategories(req: Request, res: Response, next: NextFunction) {
@@ -19,19 +20,8 @@ export class CatalogController {
 
   static async getProducts(req: Request, res: Response, next: NextFunction) {
     try {
-      const { page, limit, categorySlug, size, color, minPrice, maxPrice, isFeatured, search } = req.query as any;
-
-      const result = await CatalogService.getProducts({
-        page,
-        limit,
-        categorySlug,
-        size,
-        color,
-        minPrice,
-        maxPrice,
-        isFeatured,
-        search,
-      });
+      const queryParams = req.query as unknown as GetProductsQueryInput;
+      const result = await CatalogService.getProducts(queryParams);
 
       res.status(200).json({
         success: true,
