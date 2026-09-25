@@ -8,6 +8,7 @@ import { errorHandlerMiddleware } from './middleware/error.middleware.js';
 import { NotFoundError } from './errors/app.error.js';
 import { prisma } from './db/prisma.js';
 import { authRouter } from './modules/auth/auth.routes.js';
+import { catalogRouter } from './modules/catalog/catalog.routes.js';
 import { authenticateJwt } from './middleware/auth.middleware.js';
 import { requireRole, requirePermission } from './middleware/rbac.middleware.js';
 import { RoleName } from '@prisma/client';
@@ -46,6 +47,7 @@ app.get('/api/v1/health', async (req: Request, res: Response, next) => {
 // 3. API V1 Routes
 const v1Router = express.Router();
 v1Router.use('/auth', authRouter);
+v1Router.use('/catalog', catalogRouter);
 
 // Sample Protected RBAC Route for Testing Role Guards
 v1Router.get('/admin/super-only', authenticateJwt, requireRole([RoleName.SUPER_ADMIN]), (_req: Request, res: Response) => {
