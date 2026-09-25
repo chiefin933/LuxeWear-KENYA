@@ -15,7 +15,8 @@
     "prisma:migrate": "npx prisma migrate dev --name init",
     "prisma:seed": "npx tsx prisma/seed.ts",
     "test:db": "npx tsx tests/db-invariants.test.ts",
-    "test:foundation": "npx tsx tests/backend-foundation.test.ts"
+    "test:foundation": "npx tsx tests/backend-foundation.test.ts",
+    "test:auth": "npx tsx tests/auth-rbac.test.ts"
   },
   "prisma": {
     "seed": "npx tsx prisma/seed.ts"

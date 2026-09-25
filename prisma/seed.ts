@@ -1,4 +1,5 @@
-import { PrismaClient, RoleName, CustomerTier } from '@prisma/client';
+import { PrismaClient, RoleName } from '@prisma/client';
+import bcrypt from 'bcrypt';
 
 const prisma = new PrismaClient();
 
@@ -6,7 +7,7 @@ async function main() {
   console.log('🌱 Starting LuxeWear Kenya Database Seed...');
 
   // 1. Seed Roles & Permissions
-  console.log('🔐 Seeding Roles...');
+  console.log('🔐 Seeding Roles & Permissions...');
   const rolesData = [
     { name: RoleName.SUPER_ADMIN, description: 'Full system administration and store management access' },
     { name: RoleName.STORE_MANAGER, description: 'Catalog, order fulfillment, and report access' },
@@ -22,18 +23,56 @@ async function main() {
     });
   }
 
+  // Seed sample permissions
+  const permissionsData = [
+    { action: 'products:read', description: 'View product catalog' },
+    { action: 'products:write', description: 'Create and edit products' },
+    { action: 'orders:read', description: 'View customer orders' },
+    { action: 'orders:fulfill', description: 'Dispatch and update order fulfillment' },
+    { action: 'inventory:adjust', description: 'Adjust stock levels' },
+  ];
+
+  for (const p of permissionsData) {
+    await prisma.permission.upsert({
+      where: { action: p.action },
+      update: { description: p.description },
+      create: p,
+    });
+  }
+
+  // Link permissions to SUPER_ADMIN role
+  const superAdminRole = await prisma.role.findUnique({ where: { name: RoleName.SUPER_ADMIN } });
+  const allPermissions = await prisma.permission.findMany();
+
+  if (superAdminRole) {
+    for (const perm of allPermissions) {
+      await prisma.rolePermission.upsert({
+        where: {
+          roleId_permissionId: {
+            roleId: superAdminRole.id,
+            permissionId: perm.id,
+          },
+        },
+        update: {},
+        create: {
+          roleId: superAdminRole.id,
+          permissionId: perm.id,
+        },
+      });
+    }
+  }
+
   // 2. Seed Admin User
   console.log('👤 Seeding Admin User...');
-  const superAdminRole = await prisma.role.findUnique({ where: { name: RoleName.SUPER_ADMIN } });
+  const adminPasswordHash = bcrypt.hashSync('AdminSecret2026!', 10);
 
-  const adminUser = await prisma.user.upsert({
+  await prisma.user.upsert({
     where: { email: 'admin@luxewear.co.ke' },
-    update: {},
+    update: { passwordHash: adminPasswordHash },
     create: {
       email: 'admin@luxewear.co.ke',
       fullName: 'Super Admin',
-      // In production, use bcrypt hash. For dev seed, placeholder hash:
-      passwordHash: '$2b$10$e8TjD0K6FvUqK7H5bE3uBeF8Nq4e.4i8t5w9Z7X6Y5Z4W3V2U1T0S',
+      passwordHash: adminPasswordHash,
       isActive: true,
       userRoles: {
         create: {
@@ -343,7 +382,6 @@ async function main() {
       },
     });
 
-    // Create Images
     for (const img of item.images) {
       await prisma.productImage.create({
         data: {
@@ -355,7 +393,6 @@ async function main() {
       });
     }
 
-    // Create Variants & Initial Stock
     for (const v of item.variants) {
       const sku = `${item.skuPrefix}-${v.size}-${v.color.replace(/\s+/g, '').toUpperCase()}`;
 
@@ -398,19 +435,6 @@ async function main() {
         free_delivery_threshold_kes: 7500,
       },
       description: 'LuxeWear Kenya delivery rates by zone and free shipping threshold',
-    },
-  });
-
-  await prisma.storeSetting.upsert({
-    where: { key: 'checkout_config' },
-    update: {},
-    create: {
-      key: 'checkout_config',
-      value: {
-        reservation_ttl_minutes: 15,
-        stk_push_timeout_seconds: 60,
-      },
-      description: 'Checkout reservation locks and M-Pesa STK push timeouts',
     },
   });
 

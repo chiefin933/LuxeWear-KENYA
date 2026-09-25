@@ -7,6 +7,10 @@ import { globalRateLimiter } from './middleware/rateLimit.middleware.js';
 import { errorHandlerMiddleware } from './middleware/error.middleware.js';
 import { NotFoundError } from './errors/app.error.js';
 import { prisma } from './db/prisma.js';
+import { authRouter } from './modules/auth/auth.routes.js';
+import { authenticateJwt } from './middleware/auth.middleware.js';
+import { requireRole, requirePermission } from './middleware/rbac.middleware.js';
+import { RoleName } from '@prisma/client';
 
 export const app = express();
 
@@ -25,7 +29,6 @@ app.get('/health', (_req: Request, res: Response) => {
 
 app.get('/api/v1/health', async (req: Request, res: Response, next) => {
   try {
-    // Ping PostgreSQL DB
     await prisma.$queryRaw`SELECT 1`;
     res.status(200).json({
       success: true,
@@ -40,11 +43,19 @@ app.get('/api/v1/health', async (req: Request, res: Response, next) => {
   }
 });
 
-// 3. API V1 Router Placeholder (To be populated by feature modules)
+// 3. API V1 Routes
 const v1Router = express.Router();
-v1Router.get('/', (_req: Request, res: Response) => {
-  res.json({ message: 'LuxeWear Kenya API v1 Engine Active' });
+v1Router.use('/auth', authRouter);
+
+// Sample Protected RBAC Route for Testing Role Guards
+v1Router.get('/admin/super-only', authenticateJwt, requireRole([RoleName.SUPER_ADMIN]), (_req: Request, res: Response) => {
+  res.status(200).json({ success: true, message: 'Super Admin access granted.' });
 });
+
+v1Router.get('/admin/products-write-only', authenticateJwt, requirePermission(['products:write']), (_req: Request, res: Response) => {
+  res.status(200).json({ success: true, message: 'Permission products:write granted.' });
+});
+
 app.use('/api/v1', v1Router);
 
 // 4. 404 Route Handler
