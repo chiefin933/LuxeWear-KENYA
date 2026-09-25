@@ -20,6 +20,9 @@ export class CatalogController {
 
   static async getProducts(req: Request, res: Response, next: NextFunction) {
     try {
+      // validate middleware has already Zod-coerced req.query values
+      // (page/limit → number, minPrice/maxPrice → number, isFeatured → boolean).
+      // The double-cast to unknown bridges Express's ParsedQs static type.
       const queryParams = req.query as unknown as GetProductsQueryInput;
       const result = await CatalogService.getProducts(queryParams);
 

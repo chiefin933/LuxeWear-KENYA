@@ -118,6 +118,21 @@ async function run() {
     assert(res.body.data.items.length === 1, 'expected 1 line item');
     assert(res.body.data.items[0].quantity === 2, 'quantity must be 2');
     assert(res.body.data.subtotalKes > 0, 'subtotal must be positive');
+
+    // Cart view must expose stockStatus badge, never raw quantity
+    const lineItem = res.body.data.items[0];
+    assert(
+      ['IN_STOCK', 'LOW_STOCK', 'OUT_OF_STOCK'].includes(lineItem.stockStatus),
+      `stockStatus must be a badge string, got: ${lineItem.stockStatus}`
+    );
+    assert(lineItem.stockAvailable === undefined, 'raw stockAvailable must NOT be in the response');
+
+    // Subtotal correctness: subtotal must equal unitPrice × quantity
+    const expectedSubtotal = lineItem.unitPriceKes * lineItem.quantity;
+    assert(
+      Math.abs(res.body.data.subtotalKes - expectedSubtotal) < 0.01,
+      `subtotal (${res.body.data.subtotalKes}) must equal unitPrice×qty (${expectedSubtotal})`
+    );
   });
 
   await test('PUT /api/v1/cart/items — updates existing item quantity', async () => {
@@ -385,10 +400,22 @@ async function run() {
     const statuses = [r1.status, r2.status];
     const successes = statuses.filter((s) => s === 201).length;
     const failures = statuses.filter((s) => s === 409).length;
+    const loser = r1.status === 409 ? r1 : r2;
+    const loserCode = loser.body.code;
+
+    // The loser must always return a recognised business error code:
+    // INSUFFICIENT_STOCK    → lost the free-stock race
+    // SERIALIZATION_FAILURE → PostgreSQL serialization conflict (retryable)
+    const validConflictCodes = ['INSUFFICIENT_STOCK', 'SERIALIZATION_FAILURE'];
 
     console.log(`\n   → Concurrent result — success: ${successes}, blocked: ${failures}`);
+    console.log(`   → Loser error code: ${loserCode}`);
     assert(successes === 1, `expected exactly 1 success, got ${successes}`);
     assert(failures === 1, `expected exactly 1 failure, got ${failures}`);
+    assert(
+      validConflictCodes.includes(loserCode),
+      `loser must return a known business conflict code, got: ${loserCode}`
+    );
   });
 
   await test('POST /checkout/initiate — writes checkout.initiated outbox event', async () => {

@@ -73,6 +73,9 @@ export class CheckoutService {
                   },
                 },
                 inventory: { select: { stockQuantity: true } },
+                // priceOverrideKes is required for correct per-variant pricing
+                // (Prisma includes all scalar fields by default in `include`, so
+                //  this is already present — but made explicit here for clarity)
               },
             },
           },

@@ -52,7 +52,7 @@ export class CartService {
                     },
                   },
                 },
-                inventory: { select: { stockQuantity: true } },
+                inventory: { select: { stockQuantity: true, safetyStockThreshold: true } },
               },
             },
           },
@@ -67,6 +67,13 @@ export class CartService {
       const p = v.product;
       const unitPrice = v.priceOverrideKes ?? p.salePriceKes ?? p.basePriceKes;
       const lineTotal = Number(unitPrice) * item.quantity;
+
+      // Badge — never expose raw stock quantity to the browser
+      const qty = v.inventory?.stockQuantity ?? 0;
+      const threshold = v.inventory?.safetyStockThreshold ?? 3; // per-variant threshold from DB
+      const stockStatus: 'IN_STOCK' | 'LOW_STOCK' | 'OUT_OF_STOCK' =
+        qty > threshold ? 'IN_STOCK' : qty > 0 ? 'LOW_STOCK' : 'OUT_OF_STOCK';
+
       return {
         cartItemId: item.id,
         variantId: v.id,
@@ -80,7 +87,8 @@ export class CartService {
         unitPriceKes: Number(unitPrice),
         quantity: item.quantity,
         lineTotalKes: lineTotal,
-        stockAvailable: v.inventory?.stockQuantity ?? 0,
+        stockStatus,
+        inStock: qty > 0,
       };
     });
 
