@@ -1,0 +1,38 @@
+{
+  "name": "luxewear-kenya",
+  "version": "1.0.0",
+  "description": "LuxeWear Kenya — E-Commerce Engine & Automation Platform",
+  "main": "index.js",
+  "scripts": {
+    "db:up": "docker compose up -d",
+    "db:down": "docker compose down",
+    "prisma:format": "npx prisma format",
+    "prisma:validate": "npx prisma validate",
+    "prisma:generate": "npx prisma generate",
+    "prisma:migrate": "npx prisma migrate dev --name init",
+    "prisma:seed": "npx tsx prisma/seed.ts",
+    "test:db": "npx tsx tests/db-invariants.test.ts"
+  },
+  "prisma": {
+    "seed": "npx tsx prisma/seed.ts"
+  },
+  "keywords": [
+    "ecommerce",
+    "kenya",
+    "mpesa",
+    "prisma",
+    "postgresql",
+    "n8n"
+  ],
+  "author": "LuxeWear Engineering",
+  "license": "ISC",
+  "dependencies": {
+    "@prisma/client": "^5.22.0",
+    "dotenv": "^16.4.5"
+  },
+  "devDependencies": {
+    "prisma": "^5.22.0",
+    "tsx": "^4.19.2",
+    "typescript": "^5.6.3"
+  }
+}
