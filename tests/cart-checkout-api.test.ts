@@ -97,11 +97,11 @@ async function run() {
     assert(res.body.cartToken === token, 'cartToken must match');
   });
 
-  await test('GET /api/v1/cart — stale token recovery creates new cart', async () => {
+  await test('GET /api/v1/cart — stale X-Cart-Token returns 404 NOT_FOUND', async () => {
     const staleToken = randomUUID();
     const res = await request(app).get('/api/v1/cart').set('X-Cart-Token', staleToken);
-    assert(res.status === 201, `expected 201 got ${res.status}`);
-    assert(res.body.cartToken !== staleToken, 'new token must differ from stale');
+    assert(res.status === 404, `expected 404 got ${res.status}`);
+    assert(res.body.code === 'NOT_FOUND', `expected NOT_FOUND got ${res.body.code}`);
   });
 
   await test('PUT /api/v1/cart/items — adds item to cart', async () => {

@@ -1,15 +1,15 @@
 import { Router } from 'express';
 import { CartController } from './cart.controller.js';
 import { validate } from '../../middleware/validate.middleware.js';
-import { upsertCartItemSchema, removeCartItemSchema } from './cart.schemas.js';
+import { upsertCartItemSchema, removeCartItemSchema, cartTokenHeaderSchema } from './cart.schemas.js';
 
 export const cartRouter = Router();
 
 /**
  * GET /api/v1/cart
- * Returns the current cart (creates one if X-Cart-Token is missing/stale).
+ * Returns the current cart (creates one if X-Cart-Token is missing, returns 404 if invalid/stale token).
  */
-cartRouter.get('/', CartController.getCart);
+cartRouter.get('/', validate(cartTokenHeaderSchema), CartController.getCart);
 
 /**
  * PUT /api/v1/cart/items

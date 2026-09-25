@@ -124,6 +124,35 @@ async function runCatalogApiTests() {
       throw new Error(`404 product test failed with status ${res404.status}`);
     }
 
+    // ---------------------------------------------------------------
+    // TEST 9: Sale Item Effective Price Filtering Alignment Check
+    // ---------------------------------------------------------------
+    console.log('\n▶ TEST 9: GET /api/v1/catalog/products?minPrice=6000&maxPrice=7000 (Effective Sale Price)');
+    const testProd = await prisma.product.findFirst({ where: { slug: 'nairobi-nights-satin-gala-dress' } });
+    if (testProd) {
+      await prisma.product.update({
+        where: { id: testProd.id },
+        data: { salePriceKes: 6500.00 }, // Base is 8500, sale is 6500
+      });
+    }
+
+    const resSaleFilter = await request(app).get('/api/v1/catalog/products?minPrice=6000&maxPrice=7000');
+    const matchesSaleItem = resSaleFilter.body.data.some((p: any) => p.slug === 'nairobi-nights-satin-gala-dress');
+
+    if (testProd) {
+      await prisma.product.update({
+        where: { id: testProd.id },
+        data: { salePriceKes: null },
+      });
+    }
+
+    if (resSaleFilter.status === 200 && matchesSaleItem) {
+      console.log('   ✅ PASS: Sale items correctly match minPrice/maxPrice filters based on effective salePriceKes.');
+      passed++;
+    } else {
+      throw new Error('Effective sale price filtering failed: sale product omitted from matching range.');
+    }
+
     console.log(`\n🎉 SUMMARY: All ${passed} / ${passed} Catalog API Integration Tests PASSED Successfully!`);
   } catch (err) {
     console.error('\n❌ Catalog API Test Failed:', err);

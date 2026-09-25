@@ -7,8 +7,8 @@ import { randomUUID } from 'crypto';
 /**
  * Resolve the cart for a request.
  * - If cartToken is provided and the cart exists, return it.
- * - If cartToken is provided but stale (not found), create a fresh cart with that token.
- * - If no token provided, create a brand-new cart and return both cart + new token.
+ * - If cartToken is provided but not found, throw NotFoundError (CART_NOT_FOUND).
+ * - If no token provided (fresh guest), create a brand-new cart and return both cart + new token.
  */
 export class CartService {
   // ─── Internal Helpers ─────────────────────────────────────────────────────
@@ -19,10 +19,14 @@ export class CartService {
         where: { sessionToken: cartToken },
         include: { items: true },
       });
-      if (existing) return { cart: existing, token: cartToken, isNew: false };
+      if (existing) {
+        return { cart: existing, token: cartToken, isNew: false };
+      }
+      // Stale or invalid cart token provided
+      throw new NotFoundError('Cart not found. It may have expired.');
     }
 
-    // Create a new cart
+    // No cart token provided — create a fresh guest cart
     const newToken = randomUUID();
     const cart = await prisma.cart.create({
       data: { sessionToken: newToken },
@@ -71,7 +75,7 @@ export class CartService {
 
       // Badge — never expose raw stock quantity to the browser
       const qty = v.inventory?.stockQuantity ?? 0;
-      const threshold = v.inventory?.safetyStockThreshold ?? 3; // per-variant threshold from DB
+      const threshold = v.inventory?.safetyStockThreshold ?? 3;
       const stockStatus: 'IN_STOCK' | 'LOW_STOCK' | 'OUT_OF_STOCK' =
         qty > threshold ? 'IN_STOCK' : qty > 0 ? 'LOW_STOCK' : 'OUT_OF_STOCK';
 

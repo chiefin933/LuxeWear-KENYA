@@ -6,7 +6,7 @@ import {
 } from '../../errors/app.error.js';
 import { InitiateCheckoutInput } from './checkout.schemas.js';
 import { PricingService } from '../catalog/pricing.service.js';
-import { randomUUID, createHash } from 'crypto';
+import { randomUUID } from 'crypto';
 import { Prisma } from '@prisma/client';
 
 // ─── Business Constants ────────────────────────────────────────────────────
@@ -25,16 +25,19 @@ function normaliseKenyanPhone(raw: string): string {
 }
 
 /**
- * Computes a SHA-256 fingerprint hash for the entire checkout request payload
- * to guarantee strict idempotency verification across all parameters.
+ * Deep-compares two delivery address objects for idempotency validation.
  */
-function computeRequestFingerprint(input: InitiateCheckoutInput): string {
-  const normalized = {
-    cartToken: input.cartToken,
-    phoneNumber: normaliseKenyanPhone(input.phoneNumber),
-    deliveryAddress: input.deliveryAddress,
-  };
-  return createHash('sha256').update(JSON.stringify(normalized)).digest('hex');
+function isDeliveryAddressEqual(addr1: any, addr2: any): boolean {
+  if (!addr1 || !addr2) return false;
+  return (
+    addr1.recipientName === addr2.recipientName &&
+    addr1.phoneNumber === addr2.phoneNumber &&
+    addr1.city === addr2.city &&
+    addr1.suburbArea === addr2.suburbArea &&
+    addr1.streetAddress === addr2.streetAddress &&
+    (addr1.buildingName || '') === (addr2.buildingName || '') &&
+    (addr1.deliveryZone || '') === (addr2.deliveryZone || '')
+  );
 }
 
 /**
@@ -82,14 +85,13 @@ export class CheckoutService {
    *  7. Write an OutboxEvent for n8n to pick up.
    *
    * Idempotent when the same Idempotency-Key is resent — returns the
-   * existing CheckoutSession without re-locking inventory, verifying request payload fingerprint matching.
+   * existing CheckoutSession without re-locking inventory, verifying full request parameter consistency.
    */
   static async initiateCheckout(
     input: InitiateCheckoutInput,
     idempotencyKey?: string
   ) {
     const phoneNumber = normaliseKenyanPhone(input.phoneNumber);
-    const requestFingerprint = computeRequestFingerprint(input);
 
     // ── Pre-check Idempotency Guard ──────────────────────────────────────────
     if (idempotencyKey) {
@@ -98,15 +100,11 @@ export class CheckoutService {
         include: { reservations: true },
       });
       if (existing) {
-        // Validate request payload fingerprint consistency
-        const storedFingerprint = (existing.deliveryAddressJson as any)?._fingerprint;
-        if (storedFingerprint && storedFingerprint !== requestFingerprint) {
-          throw new ConflictError(
-            'Idempotency-Key reused with different request parameters.',
-            'IDEMPOTENCY_CONFLICT'
-          );
-        }
-        if (existing.phoneNumber !== phoneNumber) {
+        // Validate request parameter consistency (phone & delivery address)
+        if (
+          existing.phoneNumber !== phoneNumber ||
+          !isDeliveryAddressEqual(existing.deliveryAddressJson, input.deliveryAddress)
+        ) {
           throw new ConflictError(
             'Idempotency-Key reused with different request parameters.',
             'IDEMPOTENCY_CONFLICT'
@@ -251,18 +249,12 @@ export class CheckoutService {
               );
             }
 
-            // Store delivery address along with SHA-256 payload fingerprint
-            const deliveryAddressJson = {
-              ...input.deliveryAddress,
-              _fingerprint: requestFingerprint,
-            };
-
-            // Create CheckoutSession
+            // Create CheckoutSession with clean deliveryAddressJson (no internal metadata mutation)
             const session = await tx.checkoutSession.create({
               data: {
                 checkoutToken,
                 phoneNumber,
-                deliveryAddressJson: deliveryAddressJson as object,
+                deliveryAddressJson: input.deliveryAddress as object,
                 subtotalKes,
                 deliveryFeeKes,
                 totalPayableKes,
@@ -315,8 +307,10 @@ export class CheckoutService {
           include: { reservations: true },
         });
         if (winningSession) {
-          const storedFingerprint = (winningSession.deliveryAddressJson as any)?._fingerprint;
-          if (storedFingerprint && storedFingerprint !== requestFingerprint) {
+          if (
+            winningSession.phoneNumber !== phoneNumber ||
+            !isDeliveryAddressEqual(winningSession.deliveryAddressJson, input.deliveryAddress)
+          ) {
             throw new ConflictError(
               'Idempotency-Key reused with different request parameters.',
               'IDEMPOTENCY_CONFLICT'
@@ -341,15 +335,12 @@ export class CheckoutService {
 
   // ─── Format response ─────────────────────────────────────────────────────
   private static formatCheckoutResponse(session: any) {
-    const delAddr = { ...session.deliveryAddressJson };
-    delete delAddr._fingerprint; // Clean up internal fingerprint from public API response
-
     return {
       checkoutSessionId: session.id,
       checkoutToken: session.checkoutToken,
       status: session.status,
       phoneNumber: session.phoneNumber,
-      deliveryAddress: delAddr,
+      deliveryAddress: session.deliveryAddressJson,
       subtotalKes: Number(session.subtotalKes),
       deliveryFeeKes: Number(session.deliveryFeeKes),
       totalPayableKes: Number(session.totalPayableKes),
